@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Private content access</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <h1>Private content</h1>
+  <form method="post" action="/login" autocomplete="off">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required autofocus>
+    <input type="hidden" name="next" value="{{.Next}}">
+    <button type="submit">Sign in</button>
+  </form>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <p><a href="/protected/index.html">Open protected content</a></p>
+  <form method="post" action="/logout">
+    <button type="submit" class="secondary">Sign out</button>
+  </form>
+</body>
+</html>

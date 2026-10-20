@@ -1,0 +1,6 @@
+body { font-family: system-ui, sans-serif; max-width: 26rem; margin: 4rem auto; padding: 0 1rem; color: #232f3e; }
+label, input, button { display: block; width: 100%; box-sizing: border-box; }
+input { padding: .6rem; margin: .4rem 0 1rem; font-size: 1rem; }
+button { padding: .6rem; font-size: 1rem; cursor: pointer; }
+.error { color: #b00020; }
+.secondary { margin-top: .6rem; background: none; border: 1px solid #999; }
