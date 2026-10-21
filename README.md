@@ -1,143 +1,171 @@
 # CloudFront 签名 Cookie 保护私有 S3 内容
 
-用 Go Web 应用登录用户并下发 **CloudFront 签名 Cookie**。浏览器拿到 Cookie 后，可以通过 CloudFront 直接读取私有 S3 里的文件，
-不需要为每个对象生成签名 URL。
+一个 Go Web 应用校验用户身份后下发 **CloudFront 签名 Cookie**。浏览器带着 Cookie 访问 `/protected/*`，
+CloudFront 在边缘验签，通过后才从私有 S3 桶取文件。一次签名覆盖整个路径，不需要为每个对象生成签名 URL。
 
-应用部署在**私有子网的 EC2** 上，CloudFront 通过 **VPC origin** 访问它。实例没有公网 IP，不对公网开放任何端口。
+## 1. 工作原理
 
 ```
-                        https://<分发>.cloudfront.net
-                                     │
-          ┌──────────────────────────┴───────────────────────────┐
-          │ 默认行为 /*                                           │ /protected/*
-          │ 不需要 Cookie                                         │ 需要 Trusted key group 的签名 Cookie
-          ▼                                                       ▼
-   VPC origin (HTTP :8080)                                  私有 S3 桶（OAC，Block Public Access）
-          │
-          ▼
-   EC2 t4g.micro，私有子网，无公网 IP
-   Go 应用（systemd）：GET / /login，POST /login /logout
-          │
-          ├─ Secrets Manager（专用 KMS）：cfcookie/signing-key, cfcookie/login-password
-          ├─ SSM 参数：/cfcookie/distribution-domain
-          └─ 以上都经 VPC endpoint 访问，实例没有互联网出口
+浏览器                           CloudFront                        Go 应用 (EC2)            S3（私有）
+  │ 1. POST /login password=…      │                                  │                        │
+  │───────────────────────────────>│ 默认行为，转发给应用 ──────────────>│                        │
+  │                                │                                  │ 校验密码               │
+  │                                │                                  │ 用私钥签策略           │
+  │ 2. 303 + 4 个 Set-Cookie        │<──────────────────────────────────│                        │
+  │<───────────────────────────────│                                  │                        │
+  │ 3. GET /protected/report.txt    │                                  │                        │
+  │    Cookie: CloudFront-…         │                                  │                        │
+  │───────────────────────────────>│ 用 Key group 里的公钥验签          │                        │
+  │                                │ 检查资源和过期时间                 │                        │
+  │                                │ 通过 → 经 OAC 读取 ─────────────────────────────────────────>│
+  │ 4. 200 文件内容                 │<─────────────────────────────────────────────────────────────│
+  │<───────────────────────────────│ 不通过 → 403，不访问 S3             │                        │
 ```
 
-为什么登录应用和内容放在同一个分发里：签名 Cookie 只会发给设置它的主机，所以签发 Cookie 的服务必须能通过同一个 CloudFront 域名访问。
+### 1.1 四个 Cookie
 
-## 文档
-
-| 文档 | 内容 |
+| Cookie | 内容 |
 |---|---|
-| [docs/cloudfront-s3-setup.md](docs/cloudfront-s3-setup.md) | CloudFront + S3 配置：私有桶与 OAC、公钥与 Key group、行为与缓存策略、Cookie 格式、验证与排障、密钥轮换 |
-| [docs/webapp-setup.md](docs/webapp-setup.md) | Web 应用配置：网络与安全组、环境变量与机密、主机布局与 systemd、部署更新与回滚、运维与日志、本地开发、费用 |
+| `CloudFront-Policy` | 策略 JSON，Base64 编码（CloudFront 变体：`+`→`-`，`=`→`_`，`/`→`~`） |
+| `CloudFront-Signature` | 用私钥对策略 JSON 做的 RSA 签名，同样编码 |
+| `CloudFront-Key-Pair-Id` | CloudFront 公钥 ID，告诉 CloudFront 用哪把公钥验签 |
+| `CloudFront-Hash-Algorithm` | `SHA256`。缺少时 CloudFront 按 SHA-1 验签，SHA-256 签名会被拒绝 |
 
-## 快速开始
+策略（自定义策略）：
 
-使用 AWS profile `test`，区域 `ap-northeast-1`。需要 Go、Node.js、AWS CDK、OpenSSL。
-
-### 部署前的准备
-
-仓库里的部署专属内容已经去掉或换成占位符，需要你按情况处理：
-
-| 内容 | 仓库里的状态 | 全新部署 | 已有部署（换机器、重新克隆） |
-|---|---|---|---|
-| 账号 ID | 占位符 `123456789012` | 换成你的账号 ID | 同左 |
-| 公钥 `infra/public_key.pem` | 不入库 | 运行 `gen-keys.sh` 生成 | **不要运行 `gen-keys.sh`**，从 CloudFront 取回，见 `docs/cloudfront-s3-setup.md` 3.1.1 |
-| `infra/cdk.context.json` | 入库，键名里是占位账号 | 删掉，CDK 会重新生成 | **不要删**：它固定实例用的 AMI，重新解析会得到更新的 AMI，实例被替换，而 VPC origin 不允许这样，部署会失败并回滚（`docs/webapp-setup.md` 第 7 节） |
-
-账号 ID 要替换三处：`infra/bin/app.ts` 里的 `env.account`、下面的 `cdk bootstrap` 命令，以及（已有部署时）`infra/cdk.context.json` 键名里的 `account=`。
-查账号：
-
-```bash
-aws sts get-caller-identity --profile test --query Account --output text
+```json
+{
+  "Statement": [{
+    "Resource": "https://d111111abcdef8.cloudfront.net/protected/*",
+    "Condition": { "DateLessThan": { "AWS:EpochTime": 1792544400 } }
+  }]
+}
 ```
 
-### 命令
+- `Resource` 支持 `*` 通配，所以一组 Cookie 能访问 `/protected/` 下的所有文件。协议和域名必须与用户访问的完全一致。
+- `DateLessThan` 是过期时间，默认签发后 1 小时。还可以加 `DateGreaterThan`（生效时间）和 `IpAddress`（来源 IP），本项目没用。
 
-```bash
-./scripts/gen-keys.sh                 # RSA-2048 密钥对 + 随机登录密码（不打印任何内容）。只用于全新部署
-./scripts/build-server.sh             # build/server/cfcookie-server (linux/arm64)
-cd infra && npm install
-AWS_PROFILE=test npx cdk bootstrap aws://123456789012/ap-northeast-1   # 每个账号区域一次
-AWS_PROFILE=test npx cdk deploy --outputs-file outputs.json             # 约 15 分钟，大部分在等 VPC origin
-cd .. && ./scripts/put-secrets.sh     # 从 .secrets/ 上传私钥和密码到 Secrets Manager（file://）
-rm .secrets/private_key.pem           # 现在 Secrets Manager 里是唯一副本
-./scripts/e2e.sh                      # 30 项端到端检查
+### 1.2 Cookie 属性
+
+`Secure; HttpOnly; SameSite=Lax; Path=/protected/`，**不设置 `Domain`**。
+
+- **不设 `Domain`**：Cookie 只发给签发它的主机。所以签发 Cookie 的应用和受保护内容必须在同一个 CloudFront 域名下，本项目把应用放在同一个分发的默认行为里。
+- **`Path=/protected/`**：Cookie 只随受保护的请求发送，不会发给登录页。
+- **`HttpOnly`**：页面脚本读不到，XSS 拿不走。
+- 退出登录只是让浏览器删除 Cookie。被复制走的 Cookie 在过期前仍然有效，CloudFront 没有吊销机制，所以有效期要短。
+
+### 1.3 信任链
+
+私钥只在应用端（存 Secrets Manager），用来签名。公钥注册到 CloudFront，放进 **Key group**，再在 `/protected/*` 行为上设置
+**Trusted key groups**。CloudFront 用 `CloudFront-Key-Pair-Id` 在 Key group 里找公钥。CloudFront 要求 RSA 2048。
+
+## 2. CloudFront 配置
+
+一个分发，两个行为：
+
+| | 默认行为 `*` | `/protected/*` |
+|---|---|---|
+| 源站 | VPC origin → EC2 上的 Go 应用（HTTP 8080） | 私有 S3 桶，OAC |
+| 访问控制 | 无 | **Trusted key groups**（要求签名 Cookie） |
+| 允许的方法 | 全部（登录要 POST） | GET、HEAD |
+| Cache policy | `CachingDisabled` | `CachingOptimized` |
+| Origin request policy | `AllViewer`（转发 `Host`，见下） | 无 |
+| Viewer protocol | HTTP 重定向到 HTTPS | 仅 HTTPS |
+
+要点：
+
+- **S3 桶完全私有。** 开启 Block Public Access，桶策略只允许 `cloudfront.amazonaws.com` 且 `AWS:SourceArn` 等于这个分发的 ARN。直连 S3 返回 403。
+- **受保护行为可以放心缓存。** CloudFront 先验签再查缓存，缓存键不需要包含 Cookie。
+- **默认行为必须转发 `Host`。** 应用的跨站请求防护比较 `Origin` 和 `Host`。用 `AllViewerExceptHostHeader` 时 Host 被改成源站内网域名，浏览器提交的登录表单会被当成跨站请求拒绝。
+- **签名失败的表现**：没有 Cookie 返回 403 和 `MissingKey`；签名被篡改、缺少 Hash 算法 Cookie、过期、资源不匹配都返回 403。
+
+逐项配置、手工命令和排障见 [docs/cloudfront-s3-setup.md](docs/cloudfront-s3-setup.md)。
+
+## 3. Web 应用实现
+
+Go 标准库 `net/http`，签名用 AWS SDK 的 `github.com/aws/aws-sdk-go-v2/feature/cloudfront/sign`。
+
+| 路径 | 方法 | 作用 |
+|---|---|---|
+| `/`、`/login` | GET | 登录页（纯 HTML 表单） |
+| `/login` | POST | 校验密码，成功则下发 4 个 Cookie 并 303 跳转，失败 401 |
+| `/logout` | POST | 清除 Cookie，303 跳转到 `/` |
+| `/healthz` | GET | 健康检查 |
+
+### 3.1 签发 Cookie（`internal/signer`）
+
+```go
+cs := sign.NewCookieSigner(keyID, privateKey)
+cs.HashAlg = sign.HashSHA256 // 同时输出 CloudFront-Hash-Algorithm=SHA256
+
+expires := time.Now().Add(ttl).UTC().Truncate(time.Second)
+policy := &sign.Policy{Statements: []sign.Statement{{
+    Resource:  "https://" + domain + "/protected/*",
+    Condition: sign.Condition{DateLessThan: sign.NewAWSEpochTime(expires)},
+}}}
+cookies, err := cs.SignWithPolicy(policy, func(o *sign.CookieOptions) {
+    o.Path = "/protected/"
+    o.Secure = true
+    o.SameSite = http.SameSiteLaxMode
+    o.Expires = expires
+})
 ```
 
-CDK 用随机占位值创建两个密钥，真实内容不会出现在模板里。`put-secrets.sh` 运行之前，`POST /login` 返回 500，不会签出任何 Cookie。
+SDK 默认用 SHA-1 且不输出 Hash 算法 Cookie，所以要显式设置 `HashAlg`。SDK 的 `LoadPEMPrivKey` 只认 PKCS#1，
+本项目自己解析，PKCS#8 和 PKCS#1 都支持，并在启动时检查是不是 RSA 2048。
 
-登录密码保存在 `.secrets/login_password`（权限 600）。存到别处之后可以删除这个文件，用 `put-secrets.sh` 随时重新设置。
+### 3.2 登录（`internal/app`）
 
-## 使用
-
-浏览器打开 `https://<DistributionDomain>/`，输入密码，登录后跳转到 `/protected/index.html`。域名见 `infra/outputs.json`。这个文件由 `cdk deploy --outputs-file outputs.json` 生成，**不提交到 git**（每个环境不同）。
-丢失后可以重新生成：`aws cloudformation describe-stacks --stack-name CfCookieStack --query 'Stacks[0].Outputs' --profile test --region ap-northeast-1`，
-但 `e2e.sh` 和 `deploy-app.sh` 读的是 `outputs.json`，所以更简单的办法是在 `infra/` 下重新执行 `npx cdk deploy --outputs-file outputs.json`。没有实际变更时很快；如果本地重新构建过二进制，会顺带更新一次制品，约 1 到 2 分钟。
-
-命令行：
-
-```bash
-D=<DistributionDomain>
-curl -c jar.txt -X POST https://$D/login --data-urlencode "password=$(cat .secrets/login_password)"
-curl -b jar.txt https://$D/protected/report.txt
-curl -b jar.txt -X POST https://$D/logout -c jar.txt
+```go
+if !passwordMatches(r.PostForm.Get("password"), cfg.Password) { // SHA-256 后常量时间比较
+    s.sleep(r.Context(), s.FailDelay)                           // 失败延迟 500 ms
+    s.render(w, http.StatusUnauthorized, pageData{Error: "Wrong password.", Next: next})
+    return
+}
+cookies, _, err := cfg.Signer.Issue()
+if err != nil {
+    http.Error(w, "could not issue cookies", http.StatusInternalServerError)
+    return
+}
+for _, c := range cookies {
+    http.SetCookie(w, c)
+}
+http.Redirect(w, r, next, http.StatusSeeOther) // next 只允许 /protected/ 下的本地路径
 ```
 
-## 目录
+其他防护：标准库 `http.CrossOriginProtection` 拒绝跨站 POST；登录页用 `html/template` 转义；请求体限制 4 KB；
+CSP 不允许任何脚本；访问日志只记路径和 CloudFront 请求 ID（`X-Amz-Cf-Id`），不记表单和 Cookie。
+
+### 3.3 配置与机密（`internal/config`）
+
+- 私钥和登录密码在 Secrets Manager，运行时读取，不落盘、不进环境变量；CloudFront 域名在 SSM 参数里。
+- 配置缓存 5 分钟，轮换后自动生效；刷新失败时继续用上一次的配置。
+- 首次加载失败（例如密钥还是占位值）时登录返回 500，不会签出无效 Cookie。
+
+环境变量、部署形态、systemd、日志和运维见 [docs/webapp-setup.md](docs/webapp-setup.md)。
+
+## 4. 目录与测试
 
 ```
-cmd/server         Web 应用入口
-internal/signer    签名 Cookie（RSA-SHA256 自定义策略）
-internal/config    读取 Secrets Manager / SSM，5 分钟缓存
-internal/app       HTTP 处理器、CSRF 防护、安全头、访问日志、登录页（web/）
-infra/             CDK（TypeScript）栈 CfCookieStack
-content/protected  示例文件，部署到 s3://<桶>/protected/
-scripts/           gen-keys.sh  build-server.sh  put-secrets.sh  deploy-app.sh  e2e.sh
-docs/              两份配置指引
+cmd/server         入口：超时、优雅关闭
+internal/signer    签名 Cookie
+internal/app       HTTP 处理器、中间件、登录页
+internal/config    读取 Secrets Manager / SSM
+infra/             CDK 栈
+scripts/           密钥生成、上传机密、部署、端到端检查
+docs/              配置指引与部署指南
 ```
-
-## 更新应用
-
-```bash
-./scripts/deploy-app.sh               # 测试 → 构建 → cdk deploy → 实例拉取新版本 → 健康检查，不健康自动回滚
-```
-
-**不要替换实例。** CloudFront VPC origin 在被分发使用期间不能改指向另一个实例，替换会让部署失败并回滚。
-本栈已经为此设计（固定的逻辑 ID、恒定的 user data），改代码和改配置都不会替换实例。详见 `docs/webapp-setup.md` 第 7 节。
-
-## 测试
 
 ```bash
 go vet ./... && go test -race ./...
 ```
 
-- 单元测试验证签发的 Cookie：用公钥验证 RSA 签名（SHA-256），哈希改成 SHA-1 时测试会失败；还覆盖登录、跨站请求拒绝、开放重定向、模板转义。
-- `scripts/e2e.sh` 对线上分发检查 30 项，包括：篡改签名和缺少 Hash 算法 Cookie 被拒绝、绕过 CloudFront 直连 S3 被拒绝、
-  实例没有公网 IP、安全组没有 `0.0.0.0/0`、应用子网没有互联网路由、IMDSv2、没有 SSH 密钥对。
+签名测试用公钥验证签发的 Cookie（SHA-256），把哈希改成 SHA-1 测试会失败。部署后的端到端检查（30 项）见部署指南。
 
-## 已知限制
+## 5. 文档
 
-- **所有人共用一个密码，没有用户身份。** 演示足够。真实用户场景把 `internal/app` 里的密码校验换成 Cognito 或其他 OIDC，签名部分不用改。
-- **没有速率限制。** 失败登录只延迟 500 ms，挡不住并发猜密码。对外开放前在分发上挂 AWS WAF 速率规则。
-- **退出登录只清除浏览器里的 Cookie。** 被复制走的 Cookie 在过期前仍然有效（`COOKIE_TTL`，默认 1 小时），所以 TTL 要短。
-- **单实例，单可用区。** 没有高可用。发布有问题的版本时，从重启到自动回滚约 13 秒，期间观众收到 504。需要零中断要加 ALB 和多实例。
-- **TLS 最低版本是 TLSv1。** 使用默认的 `*.cloudfront.net` 证书时 CloudFront 不允许设置最低协议版本。要 TLS 1.2 需要自定义域名和 ACM 证书（本栈未实现）。HTTP 请求会被重定向到 HTTPS。
-- **CloudFront 到应用这一段是 HTTP**，走 VPC origin，流量不经过公网。
-- **安全组放行的是 CloudFront 托管前缀列表**，不是你自己分发的专属安全组。实例在私有子网，没有公网路径，所以这条规则只会被 VPC origin 的网卡用到。
-  更严格的做法见 `docs/webapp-setup.md` 2.3。
-- **没有访问日志。** 分发和桶都没开，应用日志只在实例本地的 journald，实例重建就没了。也没有 CloudTrail 告警。
-- **密钥没有自动轮换。** CloudFront 签名密钥需要手动轮换，见 `docs/cloudfront-s3-setup.md` 第 7 节。
-- **演示用的销毁策略。** 存储桶、KMS 密钥、密钥设置了销毁时删除，生产环境应改成 `RETAIN`。
-- 没有 Cookie 时 CloudFront 返回纯 XML 的 403（`MissingKey`）。想跳转到登录页，可以加自定义错误响应。
-- **固定月费约 $52**，其中 4 个 VPC 接口端点约 $41。明细见 `docs/webapp-setup.md` 第 10 节。
-
-## 清理
-
-```bash
-cd infra && AWS_PROFILE=test npx cdk destroy
-```
-
-删除顺序由依赖关系保证（分发 → VPC origin → 实例），桶会先被清空。这条命令我没有在本环境实际执行过。
-Secrets Manager 的两个密钥和 KMS 密钥有待删除期，期间同名密钥不能重新创建，立刻重新部署前要注意。
+| 文档 | 内容 |
+|---|---|
+| [docs/deploy.md](docs/deploy.md) | 用 CDK 部署、更新、验证、清理，以及已知限制和费用 |
+| [docs/cloudfront-s3-setup.md](docs/cloudfront-s3-setup.md) | CloudFront + S3 逐项配置、Cookie 细节、排障、密钥轮换 |
+| [docs/webapp-setup.md](docs/webapp-setup.md) | Web 应用的网络、配置、主机布局、发布与回滚、运维 |

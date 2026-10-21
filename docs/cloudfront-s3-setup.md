@@ -106,7 +106,7 @@ CloudFront 要求 **RSA 2048**。
 ### 3.1.1 公钥不入库，换一台机器时怎么找回
 
 `infra/public_key.pem` 是某个部署专属的密钥材料，已被 `.gitignore` 排除，**不会出现在新克隆的仓库里**。
-全新部署：按 README 先运行 `gen-keys.sh`，它会生成这个文件。
+全新部署：按 [deploy.md](deploy.md) 先运行 `gen-keys.sh`，它会生成这个文件。
 
 **已有部署、换了一台机器或重新克隆时，不要运行 `gen-keys.sh`。** 它会生成一把新的密钥对，下次 `cdk deploy` 会替换 CloudFront 公钥，
 线上所有 Cookie 失效，而 Secrets Manager 里还是旧私钥，服务会签出无效的 Cookie。应该从 CloudFront 把已注册的公钥取回来：

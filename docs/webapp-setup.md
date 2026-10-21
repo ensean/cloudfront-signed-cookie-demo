@@ -170,18 +170,7 @@ LockPersonality=true
 
 ## 5. 首次部署
 
-```bash
-./scripts/gen-keys.sh                # 密钥对 + 随机登录密码，不打印任何内容
-./scripts/build-server.sh            # build/server/cfcookie-server (linux/arm64)
-cd infra && npm install
-AWS_PROFILE=test npx cdk bootstrap aws://123456789012/ap-northeast-1   # 每个账号区域一次
-AWS_PROFILE=test npx cdk deploy --outputs-file outputs.json
-cd .. && ./scripts/put-secrets.sh
-rm .secrets/private_key.pem
-./scripts/e2e.sh                     # 30 项检查
-```
-
-第一次 `cdk deploy` 约 15 分钟，大部分时间在等 CloudFront VPC origin。
+部署命令见 [deploy.md](deploy.md) 第 4 节。第一次 `cdk deploy` 约 15 分钟，大部分时间在等 CloudFront VPC origin。
 
 首次启动流程：
 
