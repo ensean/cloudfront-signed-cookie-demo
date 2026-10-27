@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Static site</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #232f3e; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; }
+  img { max-width: 100%; }
+</style>
+</head>
+<body>
+  <h1>Static site</h1>
+  <p>You can read this page because your browser holds valid CloudFront signed cookies, issued after you signed in on the <a href="__MAIN_URL__/">main site</a>.</p>
+  <table>
+    <tr><th>File</th><th>View</th><th>Download</th></tr>
+    <tr><td>report.txt</td><td><a href="/report.txt">view</a></td><td><a href="/report.txt" download>download</a></td></tr>
+    <tr><td>data.csv</td><td><a href="/data.csv">view</a></td><td><a href="/data.csv" download>download</a></td></tr>
+    <tr><td>images/logo.svg</td><td><a href="/images/logo.svg">view</a></td><td><a href="/images/logo.svg" download>download</a></td></tr>
+  </table>
+  <p><img src="/images/logo.svg" alt="logo" width="240" height="80"></p>
+  <p>The cookies expire after one hour. To sign out, use the button on the <a href="__MAIN_URL__/">main site</a>.</p>
+</body>
+</html>

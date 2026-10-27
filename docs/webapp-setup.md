@@ -10,8 +10,8 @@ CloudFront 与 S3 的配置见 `docs/cloudfront-s3-setup.md`。
 | 路径 | 方法 | 作用 |
 |---|---|---|
 | `/` `/login` | GET | 登录页（纯 HTML 表单，没有 JavaScript） |
-| `/login` | POST | 校验密码；成功后下发 4 个签名 Cookie，303 跳转到受保护页面；失败返回 401 并重新显示表单 |
-| `/logout` | POST | 清除 4 个 Cookie，303 跳转到 `/` |
+| `/login` | POST | 校验密码；成功后签出 4 个 Cookie 的值，303 跳转到**静态站**的 `/_auth/set`（由那里写入 Cookie，主站不设 Cookie）；失败返回 401 并重新显示表单 |
+| `/logout` | POST | 303 跳转到静态站的 `/_auth/clear`，由那里删除 Cookie 并显示已退出页 |
 | `/style.css` | GET | 登录页样式 |
 | `/healthz` | GET | 健康检查，返回 `ok`，不读取配置 |
 
@@ -101,10 +101,10 @@ aws ec2 describe-availability-zones --profile test --region ap-northeast-1 \
 | `PRIVATE_KEY_FILE` | 二选一 | | 本地开发：私钥文件路径 |
 | `LOGIN_SECRET_ID` | 二选一 | | Secrets Manager 里登录密码的密钥名 |
 | `LOGIN_PASSWORD` | 二选一 | | 本地开发：登录密码 |
-| `DOMAIN_PARAM` | 二选一 | | 保存分发域名的 SSM 参数名 |
-| `DOMAIN` | 二选一 | | 本地开发：分发域名 |
+| `DOMAIN_PARAM` | 二选一 | | 保存**静态站**域名的 SSM 参数名（`/cfcookie/static-domain`） |
+| `DOMAIN` | 二选一 | | 本地开发：静态站域名 |
 | `COOKIE_TTL` | 否 | `1h` | Cookie 有效期，Go duration 格式，最长 7 天 |
-| `PROTECTED_PREFIX` | 否 | `/protected/` | 受保护路径，必须以 `/` 开头和结尾，不能是 `/` |
+| `PROTECTED_PREFIX` | 否 | `/protected/` | Cookie 策略覆盖的静态站路径，必须以 `/` 开头和结尾。本栈设为 `/`（整个静态站），默认登录后打开 `<前缀>index.html` |
 | `LISTEN_ADDR` | 否 | `127.0.0.1:8080` | 监听地址。实例上是 `0.0.0.0:8080` |
 | `AWS_REGION` | 是（EC2 上） | | AWS SDK 区域 |
 
@@ -301,7 +301,7 @@ aws ssm get-command-invocation --profile test --region ap-northeast-1 --instance
 
 - 只记录**路径**，不记录查询字符串、表单内容、Cookie。
 - `cf_id` 是 CloudFront 的请求 ID（响应头 `x-amz-cf-id`），把用户报告的请求直接对到这一行。
-- 登录成功记 `login ok`（含 Cookie 过期时间），失败记 `login failed`（不含任何输入内容）。
+- 登录成功记 `login ok`（含 Cookie 过期时间，不含签名），失败记 `login failed`（不含任何输入内容）。
 - 日志只在实例本地的 journald 里，实例重建就没了。需要长期保留要装 CloudWatch Agent，本项目没有做。
 
 ### 8.4 常用检查
@@ -311,7 +311,7 @@ aws ssm get-command-invocation --profile test --region ap-northeast-1 --instance
 | 访问首页 502/504 | `systemctl status cfcookie`；`ss -ltn sport = :8080`；VPC origin 状态；安全组是否被改过 |
 | 登录返回 500 | `journalctl -u cfcookie`，找 `load config`：密钥还是占位值、私钥不是 RSA 2048、密码少于 12 字符、IAM 或 VPC endpoint 不通 |
 | 登录返回 403 | 不是应用返回的。浏览器提交的表单被跨站防护拒绝时应用返回 403（日志里 `status:403`）：检查 CloudFront 默认行为的 Origin request policy 是否转发 `Host`（见 `docs/cloudfront-s3-setup.md` 4.1） |
-| 登录成功但 `/protected/` 仍 403 | Cookie 问题，见 `docs/cloudfront-s3-setup.md` 第 6 节 |
+| 登录成功但静态站仍 403 | Cookie 问题，见 `docs/cloudfront-s3-setup.md` 第 6 节 |
 | `deploy-app.sh` 失败，提示 `new release is not healthy` | 新版本起不来，已自动回滚。看输出里的 journal 片段，修好后重新部署 |
 | SSM 命令一直 `Pending` | 实例的 SSM Agent 连不上 endpoint：检查三个 SSM endpoint 和 endpoint 安全组 |
 
@@ -322,7 +322,7 @@ aws ssm get-command-invocation --profile test --region ap-northeast-1 --instance
 | 密码比较 | 先做 SHA-256 再常量时间比较，不泄露密码长度 |
 | 失败延迟 | 密码错误时延迟 500 ms 再响应（响应可被客户端取消） |
 | CSRF 防护 | Go 标准库 `http.CrossOriginProtection`：拒绝 `Sec-Fetch-Site: cross-site` 或 `Origin` 与 `Host` 不一致的 POST |
-| 开放重定向 | `next` 参数只接受 `/protected/` 下的本地路径，其他值一律换成默认页 |
+| 开放重定向 | `next` 参数只接受配置前缀下的本地路径（不含 `//`、反斜杠、换行），其他值一律换成默认页；静态站的函数还会再检查一次 |
 | 输出转义 | 登录页用 `html/template`，`next` 和错误信息自动转义 |
 | 请求体限制 | 4 KB |
 | 响应头 | `Cache-Control: no-store`、`X-Content-Type-Options`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、CSP（不允许任何脚本） |
@@ -349,14 +349,14 @@ go run ./cmd/server
 
 然后访问 `http://127.0.0.1:8080/`。
 
-限制：Cookie 带 `Secure`，浏览器不会通过 HTTP 保存它们，所以本地用浏览器登录后看不到 Cookie 效果。
-本地用 curl 验证：
+本地没有静态站，登录后的跳转指向 `DOMAIN` 里的域名，浏览器会真的去那里。用 curl 看跳转地址：
 
 ```bash
 curl -i -X POST http://127.0.0.1:8080/login --data-urlencode 'password=a-local-password-123'
 ```
 
-应该得到 `303` 和 4 条 `Set-Cookie`。
+应该得到 `303`，`Location` 是 `https://<DOMAIN>/_auth/set?e=…&k=…&n=/index.html&p=…&s=…`，响应里没有 `Set-Cookie`。
+本地启动时要设置 `PROTECTED_PREFIX=/`，与线上一致。
 
 `go run` 在没有 AWS 凭证时仍能启动，因为 AWS SDK 的客户端是惰性创建的，只有设置了 `*_SECRET_ID` 或 `DOMAIN_PARAM` 才会真正调用 AWS。
 

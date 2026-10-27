@@ -63,10 +63,16 @@ func secureHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Content-Security-Policy",
-			"default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", csp("'self'"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// csp is the policy for every response. formAction lists where the page's forms may lead.
+// Chrome applies form-action to the redirect that answers a form post as well, so pages with a
+// form must allow the static site's origin (see render).
+func csp(formAction string) string {
+	return "default-src 'none'; style-src 'self'; form-action " + formAction + "; base-uri 'none'; frame-ancestors 'none'"
 }
 
 type statusRecorder struct {
@@ -102,10 +108,18 @@ func accessLog(next http.Handler) http.Handler {
 type pageData struct {
 	Error string
 	Next  string
+	// StaticURL is the entry point of the static site; empty when the configuration cannot be loaded.
+	StaticURL string
 }
 
-func (s *Server) render(w http.ResponseWriter, status int, data pageData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+func (s *Server) render(w http.ResponseWriter, r *http.Request, status int, data pageData) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	if cfg, err := s.Config.Get(r.Context()); err == nil {
+		origin := cfg.Signer.Origin()
+		h.Set("Content-Security-Policy", csp("'self' "+origin))
+		data.StaticURL = origin + cfg.Prefix
+	}
 	w.WriteHeader(status)
 	if err := pageTmpl.Execute(w, data); err != nil {
 		slog.Error("render page", "error", err)
@@ -113,7 +127,7 @@ func (s *Server) render(w http.ResponseWriter, status int, data pageData) {
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	s.render(w, http.StatusOK, pageData{Next: r.URL.Query().Get("next")})
+	s.render(w, r, http.StatusOK, pageData{Next: r.URL.Query().Get("next")})
 }
 
 func (s *Server) style(w http.ResponseWriter, _ *http.Request) {
@@ -140,21 +154,22 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !passwordMatches(r.PostForm.Get("password"), cfg.Password) {
 		slog.Warn("login failed", "cf_id", r.Header.Get("X-Amz-Cf-Id"))
 		s.sleep(r.Context(), s.FailDelay)
-		s.render(w, http.StatusUnauthorized, pageData{Error: "Wrong password.", Next: next})
+		s.render(w, r, http.StatusUnauthorized, pageData{Error: "Wrong password.", Next: next})
 		return
 	}
 
-	cookies, expires, err := cfg.Signer.Issue()
+	// The cookies belong to the static site's host, so they are not set here: the browser is sent
+	// to the static site, which stores them and then opens next.
+	target, expires, err := cfg.Signer.HandoffURL(next)
 	if err != nil {
 		slog.Error("issue cookies", "error", err)
 		http.Error(w, "could not issue cookies", http.StatusInternalServerError)
 		return
 	}
-	for _, c := range cookies {
-		http.SetCookie(w, c)
-	}
 	slog.Info("login ok", "expires", expires, "cf_id", r.Header.Get("X-Amz-Cf-Id"))
-	http.Redirect(w, r, next, http.StatusSeeOther)
+	// The URL carries the signature. The page that submitted the form sends Referrer-Policy: no-referrer
+	// (secureHeaders), so it does not leak through Referer, and the response is never cached.
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -164,10 +179,8 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service misconfigured", http.StatusInternalServerError)
 		return
 	}
-	for _, c := range cfg.Signer.Clear() {
-		http.SetCookie(w, c)
-	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Only the static host can delete its own cookies.
+	http.Redirect(w, r, cfg.Signer.ClearURL(), http.StatusSeeOther)
 }
 
 func (s *Server) sleep(ctx context.Context, d time.Duration) {

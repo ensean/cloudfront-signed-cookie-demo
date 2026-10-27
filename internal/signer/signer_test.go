@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -183,7 +185,6 @@ func TestNewValidation(t *testing.T) {
 		{"empty domain", func(o *Options) { o.Domain = "" }},
 		{"prefix without trailing slash", func(o *Options) { o.PathPrefix = "/protected" }},
 		{"prefix without leading slash", func(o *Options) { o.PathPrefix = "protected/" }},
-		{"root prefix", func(o *Options) { o.PathPrefix = "/" }},
 		{"zero ttl", func(o *Options) { o.TTL = 0 }},
 		{"ttl too long", func(o *Options) { o.TTL = MaxTTL + time.Second }},
 	}
@@ -228,5 +229,57 @@ func TestParsePrivateKey(t *testing.T) {
 	}
 	if _, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("junk")})); err == nil {
 		t.Error("expected error for garbage key bytes")
+	}
+}
+
+func TestRootPrefixCoversTheWholeSite(t *testing.T) {
+	s, err := New(Options{KeyID: "K", Key: newKey(t, 2048), Domain: "d1.cloudfront.net", PathPrefix: "/", TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := s.Resource(), "https://d1.cloudfront.net/*"; got != want {
+		t.Errorf("resource = %q, want %q", got, want)
+	}
+	if got, want := s.Origin(), "https://d1.cloudfront.net"; got != want {
+		t.Errorf("origin = %q, want %q", got, want)
+	}
+}
+
+func TestHandoffURLCarriesAVerifiableCookieSet(t *testing.T) {
+	key := newKey(t, 2048)
+	s := newSigner(t, key)
+
+	raw, expires, err := s.HandoffURL("/docs/a.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Scheme != "https" || u.Host != "d111111abcdef8.cloudfront.net" || u.Path != HandoffPath {
+		t.Fatalf("url = %s", raw)
+	}
+	q := u.Query()
+	if q.Get("k") != "KTESTKEY123" || q.Get("n") != "/docs/a.html" || q.Get("e") != strconv.FormatInt(expires.Unix(), 10) {
+		t.Errorf("query = %v", q)
+	}
+	// The values must be what the function copies into the cookies, so they verify like cookie values.
+	policyJSON := cloudFrontDecode(t, q.Get("p"))
+	digest := sha256.Sum256(policyJSON)
+	if err := rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], cloudFrontDecode(t, q.Get("s"))); err != nil {
+		t.Fatalf("signature does not verify: %v", err)
+	}
+	// The function accepts only [A-Za-z0-9_~.-]; the raw query must not need any percent-escapes.
+	for _, k := range []string{"p", "s", "k"} {
+		if strings.Contains(u.RawQuery, k+"=") && strings.ContainsAny(q.Get(k), "+/=%") {
+			t.Errorf("%s contains characters outside the CloudFront alphabet: %q", k, q.Get(k))
+		}
+	}
+}
+
+func TestClearURL(t *testing.T) {
+	if got, want := newSigner(t, newKey(t, 2048)).ClearURL(), "https://d111111abcdef8.cloudfront.net/_auth/clear"; got != want {
+		t.Errorf("ClearURL = %q, want %q", got, want)
 	}
 }

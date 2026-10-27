@@ -1,27 +1,28 @@
 # CloudFront + S3 配置指引
 
-本文说明如何用 CloudFront 签名 Cookie 保护私有 S3 内容。CDK 栈（`infra/lib/cookie-stack.ts`）已经把下面所有资源建好，
+本文说明如何用 CloudFront 签名 Cookie 保护私有 S3 内容（静态站）。CDK 栈（`infra/lib/cookie-stack.ts`）已经把下面所有资源建好，
 这里解释每一项为什么要这样配，以及不用 CDK 时怎样手工配置、怎样排查。
 
-适用环境：账号 `123456789012`，区域 `ap-northeast-1`，AWS profile `test`。示例里的域名、分发 ID 来自当前部署，换环境时以
-`infra/outputs.json` 为准。
+适用环境：区域 `ap-northeast-1`，AWS profile `test`。示例里的域名、分发 ID 仅作说明，以 `infra/outputs.json` 为准。
 
 ## 1. 整体结构
 
 ```
-浏览器 ──https──> CloudFront (d111111abcdef8.cloudfront.net)
-                     │
-                     ├─ 默认行为  /*            ──> VPC origin ──> EC2 上的 Go 应用（签发 Cookie）
-                     │                              （见 docs/webapp-setup.md）
-                     └─ 行为      /protected/*  ──> S3 私有桶（OAC）
-                                    要求 Trusted key group 的签名 Cookie
+浏览器 ─https─> 主站 CloudFront (dMMM.cloudfront.net) ──> VPC origin ──> EC2 上的 Go 应用（签发 Cookie）
+   │                                                                    （见 docs/webapp-setup.md）
+   └──https─> 静态站 CloudFront (dSSS.cloudfront.net)
+                  ├─ 默认行为  /*          ──> S3 私有桶（OAC），要求 Trusted key group 的签名 Cookie
+                  ├─ 行为      /_auth/*    ──> CloudFront Function 直接应答：写入 / 删除 Cookie
+                  └─ 行为      /_public/*  ──> 同一个桶，不要求 Cookie：登录提示、已退出、404 页面
 ```
 
-三个要点：
+四个要点：
 
-1. **S3 桶完全私有**，只允许这个分发通过 OAC 读取，没有任何公开访问。
-2. **`/protected/*` 行为要求签名 Cookie**，由 Trusted key group 里的公钥验签。没有 Cookie、Cookie 被改、签名算法不对，CloudFront 都返回 403。
-3. **签发 Cookie 的应用和内容必须在同一个域名下。** 签名 Cookie 只会发给设置它的主机，所以登录页（EC2 应用）放在同一个分发的默认行为里。
+1. **S3 桶完全私有**，只允许静态站分发通过 OAC 读取，没有任何公开访问。
+2. **默认行为要求签名 Cookie**，由 Trusted key group 里的公钥验签。没有 Cookie、Cookie 被改、签名算法不对，CloudFront 都返回 403。
+3. **Cookie 必须由静态站的主机设置。** 主站和静态站是两个 `*.cloudfront.net` 主机，不共享 Cookie 范围（`cloudfront.net` 在公共后缀列表里）。
+   所以主站登录后跳转到静态站的 `/_auth/set`，由 CloudFront Function 写入 Cookie，原理见 [README](../README.md) 1.2。
+4. **登录提示页要放在不要求 Cookie 的路径下**（`/_public/*`），否则错误页本身也会被拒。
 
 ## 2. S3 私有桶
 
@@ -35,16 +36,17 @@
 | 对象所有权 | `BucketOwnerEnforced` | 关闭 ACL，只用策略控制 |
 | 版本控制 | 开启 | 误删、误覆盖可恢复 |
 
-对象放在 `protected/` 前缀下，URL 路径与 S3 键保持一致：`https://<域名>/protected/report.txt` 对应 `s3://<桶>/protected/report.txt`。
+URL 路径与 S3 键保持一致：`https://<静态站域名>/report.txt` 对应 `s3://<桶>/report.txt`；`_public/` 下是不要求 Cookie 的页面。
 CloudFront 把请求路径原样作为键，所以**不要**在源站配置里再加 Origin Path，否则键会错位。
 
 上传内容：
 
 ```bash
-aws s3 cp ./content/protected/ s3://<桶名>/protected/ --recursive --profile test --region ap-northeast-1
+aws s3 cp ./content/static/ s3://<桶名>/ --recursive --profile test --region ap-northeast-1
 ```
 
-本项目的示例文件由 CDK 的 `BucketDeployment` 上传，来源是 `content/protected/`，修改后 `cdk deploy` 即可。
+本项目的示例文件由 CDK 的 `BucketDeployment` 上传：`content/static/` 原样上传；`content/templates/` 里的页面（首页、登录提示、已退出、404）
+会把 `__MAIN_URL__` 换成主站地址后上传到 `index.html` 和 `_public/`。修改后 `cdk deploy` 即可，部署会让静态站缓存失效。
 
 ### 2.2 桶策略：只允许这个分发（OAC）
 
@@ -57,10 +59,13 @@ CloudFront 用 OAC（Origin Access Control）以 SigV4 访问 S3。桶策略只�
   "Action": "s3:GetObject",
   "Resource": "arn:aws:s3:::<桶名>/*",
   "Condition": {
-    "StringEquals": { "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/<分发ID>" }
+    "StringEquals": { "AWS:SourceArn": "arn:aws:cloudfront::<账号ID>:distribution/<静态站分发ID>" }
   }
 }
 ```
+
+另外给同一个主体授予 `s3:ListBucket`（资源是桶本身）。没有它，私有桶对不存在的键也返回 403，会被"请登录"页面误导；
+有了它，已登录用户访问不存在的文件得到 404。这不泄露内容：签名校验在访问 S3 之前，没有有效 Cookie 的人到不了这一步。
 
 要点：
 
@@ -167,37 +172,52 @@ rm .secrets/private_key.pem      # 上传完成后删除本地私钥
 
 ### 4.1 行为总览
 
-| | 默认行为 `*` | `/protected/*` |
-|---|---|---|
-| 源站 | VPC origin → EC2:8080（HTTP） | S3 桶（OAC） |
-| Viewer protocol | `redirect-to-https` | `https-only` |
-| 允许的方法 | GET HEAD OPTIONS PUT POST PATCH DELETE | GET HEAD |
-| Cache policy | `Managed-CachingDisabled` | `Managed-CachingOptimized` |
-| Origin request policy | `Managed-AllViewer` | 无 |
-| Trusted key groups | 无 | 本项目的 Key group |
-| Response headers policy | 无（应用自己设置安全头） | `Managed-SecurityHeadersPolicy` |
-| 压缩 | 无 | 开启 |
+**主站分发**只有一个默认行为：
+
+| | 默认行为 `*` |
+|---|---|
+| 源站 | VPC origin → EC2:8080（HTTP） |
+| Viewer protocol | `redirect-to-https` |
+| 允许的方法 | GET HEAD OPTIONS PUT POST PATCH DELETE |
+| Cache policy | `Managed-CachingDisabled` |
+| Origin request policy | `Managed-AllViewer` |
+
+**静态站分发**：
+
+| | 默认行为 `*` | `/_public/*` | `/_auth/*` |
+|---|---|---|---|
+| 源站 | S3 桶（OAC） | 同一个桶 | 同一个桶（不会被访问） |
+| Viewer protocol | `https-only` | `https-only` | `https-only` |
+| 允许的方法 | GET HEAD | GET HEAD | GET HEAD |
+| Cache policy | `Managed-CachingOptimized` | `Managed-CachingOptimized` | `Managed-CachingDisabled` |
+| Trusted key groups | 本项目的 Key group | 无 | 无 |
+| Function | 无 | 无 | `AuthHandoffFunction`（viewer request） |
+| Response headers policy | `Managed-SecurityHeadersPolicy` | 同左 | 无（函数自己设头） |
+| 其他 | 根路径 `index.html`；403 → `/_public/login-required.html`，404 → `/_public/not-found.html` | | |
 
 几处容易配错的地方：
 
-- **默认行为必须允许 POST。** 登录是 `POST /login`，只开 GET/HEAD 会得到 403。
-- **默认行为不缓存。** 登录页、重定向、Set-Cookie 都不能被缓存。
-- **默认行为的 Origin request policy 必须转发 `Host`。** 用 `Managed-AllViewer`。应用的跨站请求防护会比较 `Origin` 和 `Host`，用 `AllViewerExceptHostHeader` 时 Host 被改成源站内网域名，浏览器提交的登录表单会被误判为跨站，返回 403。
-- **`/protected/*` 行为用缓存是安全的。** CloudFront 在查缓存**之前**先校验签名 Cookie，缓存键里不需要包含 Cookie，所以不同用户共用同一份缓存对象也不会绕过认证。
-- **行为按列表顺序匹配，默认行为永远最后。** `/protected/*` 排在默认行为之前，所以受保护路径先命中它。新增行为时注意顺序，范围大的模式放在后面。
+- **主站默认行为必须允许 POST。** 登录是 `POST /login`，只开 GET/HEAD 会得到 403。
+- **主站默认行为不缓存。** 登录页、重定向都不能被缓存。
+- **主站默认行为的 Origin request policy 必须转发 `Host`。** 用 `Managed-AllViewer`。应用的跨站请求防护会比较 `Origin` 和 `Host`，用 `AllViewerExceptHostHeader` 时 Host 被改成源站内网域名，浏览器提交的登录表单会被误判为跨站，返回 403。
+- **静态站用缓存是安全的。** CloudFront 在查缓存**之前**先校验签名 Cookie，缓存键里不需要包含 Cookie，所以不同用户共用同一份缓存对象也不会绕过认证。
+- **错误页必须在开放路径下。** 自定义错误页由对应路径的行为取回；放在要求 Cookie 的默认行为下，它自己也会被拒。错误页缓存时间设为 0。
+- **行为按列表顺序匹配，默认行为永远最后。** `/_public/*` 和 `/_auth/*` 先于默认行为命中。新增行为时注意顺序，范围大的模式放在后面。
+- **`/_auth/*` 的函数是 viewer request 类型**，在缓存和源站之前运行并直接返回响应。它读完整的查询字符串，不受缓存策略里查询字符串白名单的影响。
 
 ### 4.2 域名与 TLS
 
 - 默认使用 `*.cloudfront.net` 证书，此时**最低 TLS 版本固定为 TLSv1**，无法修改。HTTP 请求会被重定向到 HTTPS。
 - 要强制 TLS 1.2：使用自定义域名，在 `us-east-1` 申请 ACM 证书，分发里设置 `SecurityPolicy = TLSv1.2_2021`。
-- **本栈目前不支持自定义域名。** 要使用，需要在 `infra/lib/cookie-stack.ts` 的 `Distribution` 里加 `domainNames` 和 `certificate`，
-  并把 SSM 参数 `/cfcookie/distribution-domain` 的值改成自定义域名。不要手工改这个参数：它由 CDK 管理，下次部署会被覆盖回 `*.cloudfront.net`。
+- **本栈目前不支持自定义域名。** 要使用，需要在 `infra/lib/cookie-stack.ts` 的 `StaticDistribution` 里加 `domainNames` 和 `certificate`，
+  并把 SSM 参数 `/cfcookie/static-domain` 的值改成静态站的自定义域名。不要手工改这个参数：它由 CDK 管理，下次部署会被覆盖回 `*.cloudfront.net`。
   Cookie 策略里的域名必须与用户实际访问的域名一致，否则签名有效但资源不匹配，CloudFront 返回 403。
+  两个站放在同一个父域下时，应用可以直接设置 `Domain=<父域>` 的 Cookie，不再需要 `/_auth/set` 这一跳。
   应用每 5 分钟重新读取一次配置，部署后最多 5 分钟生效。
 
 ### 4.3 Cookie 内容
 
-应用设置 4 个 Cookie，缺一个签名就会失败：
+应用签出 4 个 Cookie 的值，由静态站的函数写成 Cookie，缺一个签名就会失败：
 
 | Cookie | 内容 |
 |---|---|
@@ -211,7 +231,7 @@ rm .secrets/private_key.pem      # 上传完成后删除本地私钥
 ```json
 {
   "Statement": [{
-    "Resource": "https://d111111abcdef8.cloudfront.net/protected/*",
+    "Resource": "https://d222222abcdef8.cloudfront.net/*",
     "Condition": { "DateLessThan": { "AWS:EpochTime": 1792544400 } }
   }]
 }
@@ -220,12 +240,12 @@ rm .secrets/private_key.pem      # 上传完成后删除本地私钥
 - **必须带 `CloudFront-Hash-Algorithm=SHA256`。** 缺少这个 Cookie 时 CloudFront 默认按 SHA-1 验签，SHA-256 的签名会被拒绝。
 - Base64 编码要换字符：`+`→`-`，`=`→`_`，`/`→`~`。用 AWS SDK 的 `sign` 包不用自己处理。
 - `Resource` 里的协议和域名要与访问的完全一致，路径支持 `*` 通配。
-- Cookie 属性：`Secure; HttpOnly; SameSite=Lax; Path=/protected/`，**不设置 `Domain`**（只对当前主机有效）。
-  `Path=/protected/` 让这些 Cookie 不会随登录页请求发给应用。
+- Cookie 属性：`Secure; HttpOnly; SameSite=Lax; Path=/`，**不设置 `Domain`**（只对静态站这一个主机有效）。
+  Cookie 在静态站的主机上，不会发给主站的应用。
 
 ## 5. 验证
 
-CDK 部署后，用脚本做端到端检查（30 项）：
+CDK 部署后，用脚本做端到端检查：
 
 ```bash
 ./scripts/e2e.sh
@@ -234,27 +254,32 @@ CDK 部署后，用脚本做端到端检查（30 项）：
 手工验证 S3 + Cookie 这部分：
 
 ```bash
-D=<分发域名>
-# 1. 没有 Cookie：403，响应体含 MissingKey
-curl -i https://$D/protected/index.html
+M=<主站域名>; S=<静态站域名>
+# 1. 没有 Cookie：403，页面是"请登录"
+curl -i https://$S/index.html
 
-# 2. 登录拿 Cookie（表单提交，保存到 jar）
-curl -c jar.txt -i -X POST https://$D/login --data-urlencode "password=$(cat .secrets/login_password)"
+# 2. 登录：主站返回 303，Location 是静态站的 /_auth/set?p=…&s=…&k=…&e=…&n=…，主站没有 Set-Cookie
+curl -i -X POST https://$M/login --data-urlencode "password=$(cat .secrets/login_password)"
 
-# 3. 带 Cookie：200
-curl -b jar.txt -i https://$D/protected/report.txt
+# 3. 把 Location 交给静态站：303 + 4 个 Set-Cookie（保存到 jar）
+curl -i -c jar.txt '<上一步的 Location>'
 
-# 4. 绕过 CloudFront 直连 S3：403
-curl -i https://<桶名>.s3.ap-northeast-1.amazonaws.com/protected/index.html
+# 4. 带 Cookie：200
+curl -b jar.txt -i https://$S/report.txt
+
+# 5. 绕过 CloudFront 直连 S3：403
+curl -i https://<桶名>.s3.ap-northeast-1.amazonaws.com/index.html
 ```
 
 ## 6. 常见问题
 
 | 现象 | 原因与处理 |
 |---|---|
-| `403` + `MissingKey: Missing Key-Pair-Id query parameter or cookie value` | 请求没带 Cookie。检查浏览器是否在访问 `/protected/` 路径下，Cookie 的 `Path` 是 `/protected/`。 |
-| `403`，Cookie 都在 | 先看 Hash 算法：缺 `CloudFront-Hash-Algorithm=SHA256` 就会失败。再看策略里的域名是否与访问域名一致，以及是否已过期。 |
-| `403`，`AccessDenied` XML 来自 S3 | OAC 或桶策略有问题：桶策略里的分发 ARN 是否正确，OAC 的 `SigningBehavior` 是否 `always`，对象键是否真实存在（不存在的键对私有桶也返回 403）。 |
+| 静态站显示"Sign in required" | 请求没带有效 Cookie（没登录、已过期、或域名不对）。从主站登录。直接用 curl 看原始响应时是 `403`，原因 `MissingKey`。 |
+| 登录后停在 `/_auth/set` 并返回 `400` | 函数拒绝了参数：值含非法字符、`e` 已过期或超过 7 天、参数缺失或重复。检查主站与静态站的时钟，以及 `HandoffURL` 的输出。 |
+| 登录后表单提交没有任何反应（Chrome） | 登录页的 CSP `form-action` 没放行静态站。检查 SSM 参数 `/cfcookie/static-domain` 是否已写入，应用配置是否加载成功。 |
+| `403`，Cookie 都在 | 先看 Hash 算法：缺 `CloudFront-Hash-Algorithm=SHA256` 就会失败。再看策略里的域名是否是**静态站**的域名（不是主站的），以及是否已过期。 |
+| `403`，`AccessDenied` XML 来自 S3 | OAC 或桶策略有问题：桶策略里的分发 ARN 是否正确（应是静态站分发），OAC 的 `SigningBehavior` 是否 `always`。 |
 | 登录后马上又要登录 | 客户端时钟偏差大，或 `COOKIE_TTL` 太短。Cookie 过期时间是服务端时间 + TTL。 |
 | 换了新密钥对后所有人都 403 | 三处必须是同一对：Key group 里的公钥、`/etc/cfcookie/env` 里的 `KEY_ID`、Secrets Manager 里的私钥。按第 7 节的顺序操作，并等最多 5 分钟让应用读到新私钥。 |
 | 修改分发后行为没变 | CloudFront 配置传播到全部边缘约需几分钟，`aws cloudfront get-distribution` 的 `Status` 为 `Deployed` 才算完成。 |

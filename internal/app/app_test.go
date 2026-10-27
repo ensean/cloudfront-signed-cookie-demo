@@ -32,14 +32,14 @@ func newServer(t *testing.T) (*Server, *time.Duration) {
 		t.Fatal(err)
 	}
 	sg, err := signer.New(signer.Options{
-		KeyID: "KTEST", Key: key, Domain: "d1.cloudfront.net", PathPrefix: "/protected/", TTL: time.Hour,
+		KeyID: "KTEST", Key: key, Domain: "d1.cloudfront.net", PathPrefix: "/", TTL: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var slept time.Duration
 	return &Server{
-		Config:    fakeSource{cfg: &config.Config{Signer: sg, Password: []byte(testPassword), Prefix: "/protected/"}},
+		Config:    fakeSource{cfg: &config.Config{Signer: sg, Password: []byte(testPassword), Prefix: "/"}},
 		FailDelay: 250 * time.Millisecond,
 		Sleep:     func(_ context.Context, d time.Duration) { slept += d },
 	}, &slept
@@ -58,48 +58,57 @@ func post(h http.Handler, path string, form url.Values, hdr map[string]string) *
 	return rec
 }
 
-func TestLoginSuccessRedirect(t *testing.T) {
-	s, slept := newServer(t)
-	rec := post(s.Handler(), "/login", url.Values{"password": {testPassword}, "next": {"/protected/docs/a.html"}}, nil)
-
+// handoff parses the Location of a successful login: it must lead to the static site's cookie endpoint.
+func handoff(t *testing.T, rec *httptest.ResponseRecorder) url.Values {
+	t.Helper()
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303", rec.Code)
 	}
-	if loc := rec.Header().Get("Location"); loc != "/protected/docs/a.html" {
-		t.Errorf("Location = %q", loc)
+	u, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := len(rec.Result().Cookies()); got != 4 {
-		t.Errorf("cookies = %d, want 4", got)
+	if u.Scheme != "https" || u.Host != "d1.cloudfront.net" || u.Path != "/_auth/set" {
+		t.Fatalf("Location = %q, want https://d1.cloudfront.net/_auth/set?...", u)
+	}
+	return u.Query()
+}
+
+func TestLoginSuccessRedirect(t *testing.T) {
+	s, slept := newServer(t)
+	rec := post(s.Handler(), "/login", url.Values{"password": {testPassword}, "next": {"/docs/a.html"}}, nil)
+
+	q := handoff(t, rec)
+	if q.Get("n") != "/docs/a.html" {
+		t.Errorf("n = %q", q.Get("n"))
+	}
+	for _, k := range []string{"p", "s", "k", "e"} {
+		if q.Get(k) == "" {
+			t.Errorf("handoff lacks %q", k)
+		}
+	}
+	if q.Get("k") != "KTEST" {
+		t.Errorf("k = %q", q.Get("k"))
 	}
 	if *slept != 0 {
 		t.Errorf("successful login must not be delayed, slept %s", *slept)
 	}
 }
 
-func TestLoginDefaultsToProtectedIndex(t *testing.T) {
+func TestLoginDefaultsToIndex(t *testing.T) {
 	s, _ := newServer(t)
-	rec := post(s.Handler(), "/login", url.Values{"password": {testPassword}}, nil)
-	if loc := rec.Header().Get("Location"); loc != "/protected/index.html" {
-		t.Errorf("Location = %q", loc)
+	q := handoff(t, post(s.Handler(), "/login", url.Values{"password": {testPassword}}, nil))
+	if q.Get("n") != "/index.html" {
+		t.Errorf("n = %q", q.Get("n"))
 	}
 }
 
-func TestLoginSetCookieHeaders(t *testing.T) {
+// The signed cookies belong to the static host; a cookie set here could never be sent there.
+func TestLoginSetsNoCookiesOnTheMainHost(t *testing.T) {
 	s, _ := newServer(t)
 	rec := post(s.Handler(), "/login", url.Values{"password": {testPassword}}, nil)
-	lines := rec.Header().Values("Set-Cookie")
-	if len(lines) != 4 {
-		t.Fatalf("Set-Cookie lines = %d, want 4", len(lines))
-	}
-	for _, line := range lines {
-		for _, attr := range []string{"Secure", "HttpOnly", "Path=/protected/", "SameSite=Lax"} {
-			if !strings.Contains(line, attr) {
-				t.Errorf("Set-Cookie %q lacks %s", line, attr)
-			}
-		}
-		if strings.Contains(line, "Domain=") {
-			t.Errorf("Set-Cookie %q must be host-only", line)
-		}
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %v, want none", got)
 	}
 }
 
@@ -107,7 +116,7 @@ func TestLoginWrongPasswordRendersFormAgain(t *testing.T) {
 	s, slept := newServer(t)
 	for _, pw := range []string{"wrong", "", testPassword + "x", strings.ToUpper(testPassword)} {
 		*slept = 0
-		rec := post(s.Handler(), "/login", url.Values{"password": {pw}, "next": {"/protected/report.txt"}}, nil)
+		rec := post(s.Handler(), "/login", url.Values{"password": {pw}, "next": {"/report.txt"}}, nil)
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("password %q: status = %d, want 401", pw, rec.Code)
 		}
@@ -115,7 +124,7 @@ func TestLoginWrongPasswordRendersFormAgain(t *testing.T) {
 			t.Errorf("password %q: leaked %d cookies", pw, n)
 		}
 		body := rec.Body.String()
-		if !strings.Contains(body, "Wrong password.") || !strings.Contains(body, `value="/protected/report.txt"`) {
+		if !strings.Contains(body, "Wrong password.") || !strings.Contains(body, `value="/report.txt"`) {
 			t.Errorf("password %q: form not re-rendered with error and next: %s", pw, body)
 		}
 		if *slept != 250*time.Millisecond {
@@ -126,7 +135,7 @@ func TestLoginWrongPasswordRendersFormAgain(t *testing.T) {
 
 func TestNextIsHTMLEscaped(t *testing.T) {
 	s, _ := newServer(t)
-	rec := post(s.Handler(), "/login", url.Values{"password": {"bad"}, "next": {`/protected/"><script>alert(1)</script>`}}, nil)
+	rec := post(s.Handler(), "/login", url.Values{"password": {"bad"}, "next": {`/"><script>alert(1)</script>`}}, nil)
 	if strings.Contains(rec.Body.String(), "<script>") {
 		t.Errorf("unescaped markup in response: %s", rec.Body.String())
 	}
@@ -205,20 +214,47 @@ func TestSafeNext(t *testing.T) {
 	}
 }
 
-func TestLogoutClearsCookiesAndRedirects(t *testing.T) {
+func TestLogoutSendsBrowserToTheStaticSiteToClearCookies(t *testing.T) {
 	s, _ := newServer(t)
 	rec := post(s.Handler(), "/logout", url.Values{}, nil)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
-		t.Fatalf("status = %d location = %q, want 303 to /", rec.Code, rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "https://d1.cloudfront.net/_auth/clear" {
+		t.Fatalf("status = %d location = %q, want 303 to the static site's clear endpoint", rec.Code, rec.Header().Get("Location"))
 	}
-	got := rec.Result().Cookies()
-	if len(got) != 4 {
-		t.Fatalf("cookies = %d, want 4", len(got))
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %v, want none", got)
 	}
-	for _, c := range got {
-		if c.MaxAge >= 0 {
-			t.Errorf("%s not cleared: %+v", c.Name, c)
-		}
+}
+
+// Chrome applies form-action to the redirect after a form post, so the page that holds the forms
+// must allow the static origin. Other responses keep the strict default.
+func TestPageAllowsFormsToReachTheStaticSite(t *testing.T) {
+	s, _ := newServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' https://d1.cloudfront.net;") {
+		t.Errorf("CSP = %q", csp)
+	}
+	if !strings.Contains(rec.Body.String(), `href="https://d1.cloudfront.net/"`) {
+		t.Errorf("page lacks the link to the static site: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self';") {
+		t.Errorf("non-page CSP = %q", csp)
+	}
+}
+
+func TestPageStillRendersWhenConfigIsUnavailable(t *testing.T) {
+	s, _ := newServer(t)
+	s.Config = fakeSource{err: errors.New("not configured yet")}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "static site</a>") {
+		t.Errorf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self';") {
+		t.Errorf("CSP = %q", csp)
 	}
 }
 

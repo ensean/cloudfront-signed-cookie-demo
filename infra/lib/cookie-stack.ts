@@ -12,8 +12,9 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 
-const PROTECTED_PREFIX = "protected"; // S3 key prefix and URL path segment
-const DOMAIN_PARAM = "/cfcookie/distribution-domain";
+// The static site's CloudFront domain, read by the application to know which host the cookies are for.
+const DOMAIN_PARAM = "/cfcookie/static-domain";
+const PUBLIC_PREFIX = "_public"; // objects under it are served without cookies
 const SIGNING_SECRET_NAME = "cfcookie/signing-key";
 const LOGIN_SECRET_NAME = "cfcookie/login-password";
 const APP_PORT = 8080;
@@ -32,7 +33,9 @@ export class CookieStack extends cdk.Stack {
     const root = path.join(__dirname, "..", "..");
     const publicKeyFile = path.join(__dirname, "..", "public_key.pem");
     const serverDir = path.join(root, "build", "server");
-    const contentDir = path.join(root, "content", PROTECTED_PREFIX);
+    const contentDir = path.join(root, "content", "static"); // files served as they are
+    const templatesDir = path.join(root, "content", "templates"); // pages that link back to the main site
+    const authFunctionFile = path.join(__dirname, "..", "functions", "auth-handoff.js");
 
     for (const [file, hint] of [
       [publicKeyFile, "run scripts/gen-keys.sh"],
@@ -71,7 +74,7 @@ export class CookieStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // ---- Private content bucket ----
+    // ---- Private bucket behind the static site ----
     const bucket = new s3.Bucket(this, "ContentBucket", {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
@@ -248,14 +251,13 @@ export class CookieStack extends cdk.Stack {
       }),
     );
 
-    // ---- Distribution ----
-    const distribution = new cloudfront.Distribution(this, "Distribution", {
-      comment: "cfcookie: signed cookie demo",
+    // ---- Main site: login page + cookie issuing, served by the Go app ----
+    const mainDistribution = new cloudfront.Distribution(this, "MainDistribution", {
+      comment: "cfcookie: main site (login)",
       priceClass: cloudfront.PriceClass.PRICE_CLASS_200,
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
       defaultBehavior: {
-        // Login page + cookie endpoints, served by the Go app inside the private subnet.
-        // CloudFront reaches it through a VPC origin; plain HTTP stays on AWS's network.
+        // CloudFront reaches the app through a VPC origin; plain HTTP stays on AWS's network.
         origin: origins.VpcOrigin.withEc2Instance(instance, {
           protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
           httpPort: APP_PORT,
@@ -267,34 +269,104 @@ export class CookieStack extends cdk.Stack {
         // request protection compares Origin with Host, so Host must be the viewer's.
         originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER,
       },
+    });
+
+    // ---- Static site: private S3, readable only with the signed cookies ----
+    // The two sites have different *.cloudfront.net hosts, which share no cookie scope. The app
+    // cannot set cookies for the static host, so after a login it redirects the browser to
+    // /_auth/set on the static host; this function stores the cookies there (see functions/).
+    const authFunction = new cloudfront.Function(this, "AuthHandoffFunction", {
+      code: cloudfront.FunctionCode.fromFile({ filePath: authFunctionFile }),
+      runtime: cloudfront.FunctionRuntime.JS_2_0,
+      comment: "Stores / removes the signed cookies handed over by the main site",
+    });
+    const staticOrigin = origins.S3BucketOrigin.withOriginAccessControl(bucket);
+    const staticBehavior = {
+      origin: staticOrigin,
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+      allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
+      cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+      responseHeadersPolicy: cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
+      compress: true,
+    };
+    const errorPage = (status: number, page: string): cloudfront.ErrorResponse => ({
+      httpStatus: status,
+      responseHttpStatus: status,
+      responsePagePath: `/${PUBLIC_PREFIX}/${page}`,
+      ttl: cdk.Duration.seconds(0),
+    });
+    const staticDistribution = new cloudfront.Distribution(this, "StaticDistribution", {
+      comment: "cfcookie: static site (signed cookies)",
+      priceClass: cloudfront.PriceClass.PRICE_CLASS_200,
+      httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
+      defaultRootObject: "index.html",
+      defaultBehavior: {
+        ...staticBehavior,
+        // Viewers must present a valid signed cookie from this key group.
+        trustedKeyGroups: [keyGroup],
+      },
       additionalBehaviors: {
-        [`/${PROTECTED_PREFIX}/*`]: {
-          origin: origins.S3BucketOrigin.withOriginAccessControl(bucket),
-          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
-          allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-          cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-          responseHeadersPolicy: cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
-          compress: true,
-          // Viewers must present a valid signed cookie from this key group.
-          trustedKeyGroups: [keyGroup],
+        // Open to everyone: the pages that tell a visitor to sign in or that they are signed out.
+        [`/${PUBLIC_PREFIX}/*`]: staticBehavior,
+        // The function answers every request itself; the origin is never contacted.
+        "/_auth/*": {
+          ...staticBehavior,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          functionAssociations: [{ function: authFunction, eventType: cloudfront.FunctionEventType.VIEWER_REQUEST }],
         },
       },
+      errorResponses: [
+        // No / invalid / expired cookie. These pages sit under the open path above.
+        errorPage(403, "login-required.html"),
+        errorPage(404, "not-found.html"),
+      ],
     });
+    // Without s3:ListBucket, S3 answers 403 for a missing key, which would be shown as "sign in".
+    bucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:ListBucket"],
+        resources: [bucket.bucketArn],
+        principals: [new iam.ServicePrincipal("cloudfront.amazonaws.com")],
+        conditions: {
+          StringEquals: {
+            "AWS:SourceArn": cdk.Stack.of(this).formatArn({
+              service: "cloudfront",
+              region: "",
+              resource: "distribution",
+              resourceName: staticDistribution.distributionId,
+            }),
+          },
+        },
+      }),
+    );
 
     new ssm.StringParameter(this, "DomainParam", {
       parameterName: DOMAIN_PARAM,
-      stringValue: distribution.distributionDomainName,
-      description: "CloudFront domain the cookie policy is issued for",
+      stringValue: staticDistribution.distributionDomainName,
+      description: "Static site domain the cookie policy is issued for",
     });
 
-    // ---- Sample protected content ----
+    // ---- Static content ----
+    // Pages that link to the main site get its domain here; the static distribution itself does not
+    // depend on the main one, so the two do not reference each other.
+    const mainUrl = `https://${mainDistribution.distributionDomainName}`;
+    const page = (file: string, key: string) =>
+      s3deploy.Source.data(key, fs.readFileSync(path.join(templatesDir, file), "utf8").replaceAll("__MAIN_URL__", mainUrl));
     new s3deploy.BucketDeployment(this, "DeployContent", {
-      sources: [s3deploy.Source.asset(contentDir)],
+      sources: [
+        s3deploy.Source.asset(contentDir),
+        page("index.html", "index.html"),
+        page("login-required.html", `${PUBLIC_PREFIX}/login-required.html`),
+        page("signed-out.html", `${PUBLIC_PREFIX}/signed-out.html`),
+        page("not-found.html", `${PUBLIC_PREFIX}/not-found.html`),
+      ],
       destinationBucket: bucket,
-      destinationKeyPrefix: PROTECTED_PREFIX,
+      distribution: staticDistribution, // drop cached copies of changed files
+      distributionPaths: ["/*"],
     });
 
-    new cdk.CfnOutput(this, "DistributionDomain", { value: distribution.distributionDomainName });
+    new cdk.CfnOutput(this, "MainDomain", { value: mainDistribution.distributionDomainName });
+    new cdk.CfnOutput(this, "StaticDomain", { value: staticDistribution.distributionDomainName });
     new cdk.CfnOutput(this, "PublicKeyId", { value: publicKey.publicKeyId });
     new cdk.CfnOutput(this, "ContentBucketName", { value: bucket.bucketName });
     new cdk.CfnOutput(this, "SigningKeySecretName", { value: signingKeySecret.secretName });
@@ -330,7 +402,7 @@ SIGNING_KEY_SECRET_ID=${p.signingSecret}
 LOGIN_SECRET_ID=${p.loginSecret}
 DOMAIN_PARAM=${DOMAIN_PARAM}
 COOKIE_TTL=1h
-PROTECTED_PREFIX=/${PROTECTED_PREFIX}/
+PROTECTED_PREFIX=/
 ENVEOF
 chown root:cfcookie /etc/cfcookie/env
 chmod 0640 /etc/cfcookie/env

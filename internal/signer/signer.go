@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +48,7 @@ type Options struct {
 // Signer produces signed cookies for one distribution and path prefix.
 type Signer struct {
 	cs       *sign.CookieSigner
+	origin   string
 	resource string
 	path     string
 	ttl      time.Duration
@@ -67,8 +70,8 @@ func New(opts Options) (*Signer, error) {
 	if opts.Domain == "" || strings.ContainsAny(opts.Domain, "/:?# ") {
 		return nil, fmt.Errorf("signer: invalid domain %q (host name only, no scheme or path)", opts.Domain)
 	}
-	if !strings.HasPrefix(opts.PathPrefix, "/") || !strings.HasSuffix(opts.PathPrefix, "/") || opts.PathPrefix == "/" {
-		return nil, fmt.Errorf("signer: path prefix %q must start and end with / and not be the root", opts.PathPrefix)
+	if !strings.HasPrefix(opts.PathPrefix, "/") || !strings.HasSuffix(opts.PathPrefix, "/") {
+		return nil, fmt.Errorf("signer: path prefix %q must start and end with /", opts.PathPrefix)
 	}
 	if opts.TTL <= 0 || opts.TTL > MaxTTL {
 		return nil, fmt.Errorf("signer: TTL %s out of range (0, %s]", opts.TTL, MaxTTL)
@@ -83,6 +86,7 @@ func New(opts Options) (*Signer, error) {
 
 	return &Signer{
 		cs:       cs,
+		origin:   "https://" + opts.Domain,
 		resource: "https://" + opts.Domain + opts.PathPrefix + "*",
 		path:     opts.PathPrefix,
 		ttl:      opts.TTL,
@@ -90,8 +94,48 @@ func New(opts Options) (*Signer, error) {
 	}, nil
 }
 
+// Paths of the CloudFront Function on the static distribution that stores / removes the cookies.
+const (
+	HandoffPath = "/_auth/set"
+	ClearPath   = "/_auth/clear"
+)
+
 // Resource returns the policy resource pattern the cookies are valid for.
 func (s *Signer) Resource() string { return s.resource }
+
+// Origin returns the scheme and host the cookies are valid for, e.g. https://d111.cloudfront.net.
+func (s *Signer) Origin() string { return s.origin }
+
+// HandoffURL signs a new cookie set and returns the URL that installs it in the browser.
+//
+// The cookies must be stored by the host they are valid for (the static distribution), but this
+// application runs on another host, and the two *.cloudfront.net hosts share no cookie scope.
+// So the application redirects the browser to HandoffPath on the static host, where a CloudFront
+// Function turns the query parameters into Set-Cookie headers and redirects to next.
+// The parameters are the same values the cookies would carry: p (policy), s (signature),
+// k (key pair ID), e (expiry, Unix seconds) and n (the local path to open afterwards).
+func (s *Signer) HandoffURL(next string) (string, time.Time, error) {
+	cookies, expires, err := s.Issue()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	v := make(map[string]string, len(cookies))
+	for _, c := range cookies {
+		v[c.Name] = c.Value
+	}
+	q := url.Values{}
+	q.Set("p", v[sign.CookiePolicyName])
+	q.Set("s", v[sign.CookieSignatureName])
+	q.Set("k", v[sign.CookieKeyIDName])
+	q.Set("e", strconv.FormatInt(expires.Unix(), 10))
+	q.Set("n", next)
+	// A slash is legal in a query string; leaving it unescaped keeps ordinary paths readable and
+	// identical whether or not the edge decodes query values before the function sees them.
+	return s.origin + HandoffPath + "?" + strings.ReplaceAll(q.Encode(), "%2F", "/"), expires, nil
+}
+
+// ClearURL returns the URL that makes the static host drop the cookies.
+func (s *Signer) ClearURL() string { return s.origin + ClearPath }
 
 // Issue returns a fresh set of signed cookies and their expiry time.
 func (s *Signer) Issue() ([]*http.Cookie, time.Time, error) {

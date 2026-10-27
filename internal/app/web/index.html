@@ -8,6 +8,7 @@
 </head>
 <body>
   <h1>Private content</h1>
+  <p>Sign in here to open the files on the static site.</p>
   <form method="post" action="/login" autocomplete="off">
     <label for="password">Password</label>
     <input id="password" name="password" type="password" required autofocus>
@@ -15,7 +16,7 @@
     <button type="submit">Sign in</button>
   </form>
   {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
-  <p><a href="/protected/index.html">Open protected content</a></p>
+  {{if .StaticURL}}<p><a href="{{.StaticURL}}">Open the static site</a> (needs a sign-in first)</p>{{end}}
   <form method="post" action="/logout">
     <button type="submit" class="secondary">Sign out</button>
   </form>
